@@ -418,26 +418,90 @@ def garmin_trends(metric: str, period: str = "month") -> str:
 
 
 _sync_lock = threading.Lock()
+_sync_state: dict = {
+    "running": False,
+    "started_at": None,
+    "finished_at": None,
+    "last_result": None,
+}
+
+# Hard cap on a single sync operation. The synchronous code this replaced
+# enforced 300s; raised to 600s here because the bg pattern means we can't
+# return a partial result, so giving the browser more headroom is cheap.
+# Without this, a hung browser would hold _sync_lock forever and every
+# future garmin_sync(refresh=True) would return "in_progress".
+SYNC_TIMEOUT_SEC = 600
 
 
-def _run_incremental_sync() -> dict:
-    """Run the browser-based sync in a thread. Internal helper."""
+def _start_background_sync() -> dict:
+    """Start the browser-based sync in a daemon thread; return immediately.
+
+    The sync takes ~2 minutes, but most MCP clients (e.g. Claude Desktop)
+    time out at ~60s, so a synchronous result is unreachable. Returning
+    immediately lets the caller poll status via garmin_sync(refresh=False).
+    See issue #35.
+    """
     import concurrent.futures
+    from datetime import datetime, timezone
 
-    def _go():
-        from .sync import incremental_sync
+    if not _sync_lock.acquire(blocking=False):
+        return {
+            "status": "in_progress",
+            "started_at": _sync_state["started_at"],
+            "message": "A sync is already running. Check back with garmin_sync(refresh=False).",
+        }
 
-        return incremental_sync()
+    started_at = datetime.now(timezone.utc).isoformat()
+    _sync_state.update(running=True, started_at=started_at, finished_at=None, last_result=None)
 
-    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-    future = pool.submit(_go)
+    def _bg():
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        try:
+            from .sync import incremental_sync
+
+            future = pool.submit(incremental_sync)
+            try:
+                _sync_state["last_result"] = future.result(timeout=SYNC_TIMEOUT_SEC)
+            except concurrent.futures.TimeoutError:
+                log.warning("sync exceeded %ds, abandoning", SYNC_TIMEOUT_SEC)
+                _sync_state["last_result"] = {
+                    "status": "error",
+                    "error": f"Sync exceeded the {SYNC_TIMEOUT_SEC}s timeout. The browser may be hung; check server logs.",
+                }
+                pool.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            log.exception("sync failed")
+            _sync_state["last_result"] = {
+                "status": "error",
+                "error": "Sync failed. Check server logs.",
+            }
+        finally:
+            pool.shutdown(wait=False)
+            _sync_state.update(
+                running=False,
+                finished_at=datetime.now(timezone.utc).isoformat(),
+            )
+            _sync_lock.release()
+
     try:
-        return future.result(timeout=300)
-    except concurrent.futures.TimeoutError:
-        pool.shutdown(wait=False, cancel_futures=True)
-        raise
-    finally:
-        pool.shutdown(wait=False)
+        threading.Thread(target=_bg, daemon=True, name="garmin-sync").start()
+    except RuntimeError:
+        # Thread creation failed (resource exhaustion). Release the lock and
+        # surface the failure so the caller doesn't silently see "started"
+        # for a sync that will never run.
+        _sync_state.update(running=False)
+        _sync_lock.release()
+        log.exception("failed to start garmin-sync thread")
+        return {
+            "status": "error",
+            "error": "Failed to start sync thread (resource exhaustion). Check server logs.",
+        }
+
+    return {
+        "status": "started",
+        "started_at": started_at,
+        "message": "Sync running in background (~2 min). Check back with garmin_sync(refresh=False).",
+    }
 
 
 def _get_data_freshness() -> dict:
@@ -496,25 +560,17 @@ def _get_data_freshness() -> dict:
         conn.close()
 
 
-def _do_sync() -> dict:
-    """Acquire the lock and sync. Returns sync result or error dict."""
-    if not _sync_lock.acquire(blocking=False):
-        return {"status": "error", "error": "A sync is already in progress. Try again later."}
-    try:
-        return {"status": "success", "result": _run_incremental_sync()}
-    except Exception as exc:
-        log.exception("sync failed")
-        return {"status": "error", "error": "Sync failed. Check server logs."}
-    finally:
-        _sync_lock.release()
-
-
 @mcp.tool()
 def garmin_sync(refresh: bool = True) -> str:
     """Sync the latest data from Garmin Connect.
 
-    Always shows when the last sync happened before doing anything.
-    Set refresh=False to just check the status without syncing.
+    The sync runs in the background (~2 minutes). The first call returns
+    immediately with status "started"; follow up with garmin_sync(refresh=False)
+    after ~2 minutes to see the final result. This avoids MCP client timeouts
+    (Claude Desktop ~60s) that previously made synchronous sync unusable.
+
+    Set refresh=False to just check the current state and last sync result
+    without triggering a new sync.
 
     Use this when:
     - You just finished a run/ride and want to see the new data
@@ -522,20 +578,14 @@ def garmin_sync(refresh: bool = True) -> str:
     - The data looks outdated
     """
     status = _get_data_freshness()
+    status["sync_state"] = dict(_sync_state)
 
     if not refresh:
-        if status["is_stale"]:
+        if status["is_stale"] and not _sync_state["running"]:
             status["hint"] = "Data is not current. Call garmin_sync() to refresh."
         return json.dumps(status, indent=2, default=str)
 
-    sync_result = _do_sync()
-    status["sync"] = sync_result
-
-    # Refresh freshness info after sync
-    if sync_result.get("status") == "success":
-        status.update(_get_data_freshness())
-        status["sync"] = sync_result
-
+    status["sync"] = _start_background_sync()
     return json.dumps(status, indent=2, default=str)
 
 
