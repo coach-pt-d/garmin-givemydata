@@ -329,6 +329,8 @@ CREATE TABLE IF NOT EXISTS activity (
     avg_grade_adjusted_speed            REAL,
     activity_steps                      INTEGER,
     activity_min_hr                     INTEGER,
+    direct_workout_feel                 INTEGER,
+    direct_workout_rpe                  INTEGER,
     raw_json                            TEXT
 );
 
@@ -1138,6 +1140,8 @@ def migrate_activity_table(conn: sqlite3.Connection) -> None:
             ("avg_grade_adjusted_speed", "REAL"),
             ("activity_steps", "INTEGER"),
             ("activity_min_hr", "INTEGER"),
+            ("direct_workout_feel", "INTEGER"),
+            ("direct_workout_rpe", "INTEGER"),
         ],
     )
     update_map = {
@@ -1146,6 +1150,8 @@ def migrate_activity_table(conn: sqlite3.Connection) -> None:
         "avg_grade_adjusted_speed": "$.summaryDTO.avgGradeAdjustedSpeed",
         "activity_steps": "$.summaryDTO.steps",
         "activity_min_hr": "$.summaryDTO.minHR",
+        "direct_workout_feel": "$.summaryDTO.directWorkoutFeel",
+        "direct_workout_rpe": "$.summaryDTO.directWorkoutRpe",
     }
     for col, path in update_map.items():
         conn.execute(
@@ -1959,6 +1965,8 @@ def upsert_activity(conn: sqlite3.Connection, record: dict) -> None:
             avg_grade_adjusted_speed = COALESCE(:avg_grade_adjusted_speed, avg_grade_adjusted_speed),
             activity_steps           = COALESCE(:activity_steps, activity_steps),
             activity_min_hr          = COALESCE(:activity_min_hr, activity_min_hr),
+            direct_workout_feel      = COALESCE(:direct_workout_feel, direct_workout_feel),
+            direct_workout_rpe       = COALESCE(:direct_workout_rpe, direct_workout_rpe),
             raw_json = :raw_json
         WHERE activity_id = :activity_id
         """,
@@ -2014,6 +2022,8 @@ def upsert_activity(conn: sqlite3.Connection, record: dict) -> None:
             "avg_grade_adjusted_speed": summary.get("avgGradeAdjustedSpeed"),
             "activity_steps": summary.get("steps"),
             "activity_min_hr": summary.get("minHR"),
+            "direct_workout_feel": summary.get("directWorkoutFeel"),
+            "direct_workout_rpe": summary.get("directWorkoutRpe"),
             "raw_json": json.dumps(record),
         },
     )
@@ -2621,6 +2631,19 @@ def upsert_activity_exercise_sets(conn: sqlite3.Connection, activity_id: int, da
     sets = data if isinstance(data, list) else data.get("exerciseSets") or [data]
     count = 0
     for i, s in enumerate(sets):
+        # The Garmin API nests exercise details under an 'exercises' list within
+        # each set. That list is a ranked set of candidate classifications, each
+        # with a 'probability' — pick the most likely one rather than assuming
+        # list order. Fall back to top-level keys for backward compatibility.
+        exercises = s.get("exercises") or []
+        best_exercise = max(exercises, key=lambda e: e.get("probability") or 0) if exercises else {}
+        exercise_name = best_exercise.get("name") or s.get("exerciseName")
+        exercise_category = best_exercise.get("category") or s.get("exerciseCategory")
+        # repetitionCount can legitimately be 0 (e.g. a timed hold); only fall
+        # back to 'reps' when the key is genuinely absent, not when it is 0.
+        reps = s.get("repetitionCount")
+        if reps is None:
+            reps = s.get("reps")
         conn.execute(
             """INSERT OR REPLACE INTO activity_exercise_sets
                (activity_id, set_number, exercise_name, exercise_category,
@@ -2629,9 +2652,9 @@ def upsert_activity_exercise_sets(conn: sqlite3.Connection, activity_id: int, da
             (
                 activity_id,
                 i + 1,
-                s.get("exerciseName"),
-                s.get("exerciseCategory"),
-                s.get("repetitionCount") or s.get("reps"),
+                exercise_name,
+                exercise_category,
+                reps,
                 s.get("weight"),
                 s.get("duration"),
                 json.dumps(s),
@@ -3431,16 +3454,40 @@ def save_to_db(conn: sqlite3.Connection, endpoint_name: str, data, cal_date: str
 
         elif name == "activity_details":
             # Detail endpoint has a different structure (summaryDTO, activityTypeDTO)
-            # than the list endpoint. Don't overwrite the activity table — it would
-            # null out fields. Just update raw_json for activities that already exist.
+            # than the list endpoint. Don't overwrite the activity table wholesale —
+            # it would null out fields the list endpoint populated. Update raw_json
+            # plus the summaryDTO-derived columns, using COALESCE so a detail record
+            # only fills in values without clobbering anything already set.
             for rec in records:
                 aid = rec.get("activityId")
                 if aid:
                     import json as _json
 
+                    summary_dto = rec.get("summaryDTO") or {}
                     conn.execute(
-                        "UPDATE activity SET raw_json = ? WHERE activity_id = ?",
-                        (_json.dumps(rec), aid),
+                        """
+                        UPDATE activity SET
+                            raw_json = ?,
+                            body_battery_change      = COALESCE(?, body_battery_change),
+                            total_work_kcal          = COALESCE(?, total_work_kcal),
+                            avg_grade_adjusted_speed = COALESCE(?, avg_grade_adjusted_speed),
+                            activity_steps           = COALESCE(?, activity_steps),
+                            activity_min_hr          = COALESCE(?, activity_min_hr),
+                            direct_workout_feel      = COALESCE(?, direct_workout_feel),
+                            direct_workout_rpe       = COALESCE(?, direct_workout_rpe)
+                        WHERE activity_id = ?
+                        """,
+                        (
+                            _json.dumps(rec),
+                            summary_dto.get("differenceBodyBattery"),
+                            summary_dto.get("totalWork"),
+                            summary_dto.get("avgGradeAdjustedSpeed"),
+                            summary_dto.get("steps"),
+                            summary_dto.get("minHR"),
+                            summary_dto.get("directWorkoutFeel"),
+                            summary_dto.get("directWorkoutRpe"),
+                            aid,
+                        ),
                     )
                     # Extract running dynamics if present
                     upsert_running_dynamics(conn, aid, rec)
