@@ -1,0 +1,40 @@
+name: Garmin Daily Sync
+
+on:
+  schedule:
+    - cron: '0 21 * * *'  # 21:00 UTC (22:00 CET)
+  workflow_dispatch:  # Manual trigger
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.12'
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install selenium seleniumbase requests beautifulsoup4 lxml cryptography fitparse dateparser
+      
+      - name: Run Garmin sync
+        env:
+          GARMIN_USERNAME: ${{ secrets.GARMIN_USERNAME }}
+          GARMIN_PASSWORD: ${{ secrets.GARMIN_PASSWORD }}
+        run: |
+          python garmin_givemydata.py
+      
+      - name: Generate report
+        run: python garmin_daily_report.py
+      
+      - name: Commit and push report
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add garmin_report.json
+          git commit -m "Update Garmin report: $(date)" || echo "No changes"
+          git push
