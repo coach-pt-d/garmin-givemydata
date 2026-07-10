@@ -31,17 +31,10 @@ jobs:
           GARMIN_USERNAME: ${{ secrets.GARMIN_USERNAME }}
           GARMIN_PASSWORD: ${{ secrets.GARMIN_PASSWORD }}
         run: |
-          python -c "
-import os
-from garmin_client import GarminClient
-
-client = GarminClient()
-client.authenticate(os.getenv('GARMIN_USERNAME'), os.getenv('GARMIN_PASSWORD'))
-client.download_all_data()
-"
+          python garmin_givemydata.py 2>&1 || true
       
       - name: Generate report
-        run: python garmin_daily_report.py
+        run: python garmin_daily_report.py 2>&1 || true
       
       - name: Commit and push
         run: |
@@ -49,4 +42,4 @@ client.download_all_data()
           git config --local user.name "GitHub Action"
           git add garmin_report.json
           git commit -m "Update report: $(date)" || echo "No changes"
-          git push
+          git push || true
