@@ -31,7 +31,14 @@ jobs:
           GARMIN_USERNAME: ${{ secrets.GARMIN_USERNAME }}
           GARMIN_PASSWORD: ${{ secrets.GARMIN_PASSWORD }}
         run: |
-          python garmin_givemydata.py
+          python -c "
+import os
+from garmin_client import GarminClient
+
+client = GarminClient()
+client.authenticate(os.getenv('GARMIN_USERNAME'), os.getenv('GARMIN_PASSWORD'))
+client.download_all_data()
+"
       
       - name: Generate report
         run: python garmin_daily_report.py
